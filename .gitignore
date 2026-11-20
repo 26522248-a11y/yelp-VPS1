@@ -1,0 +1,9 @@
+runs/
+chunks/
+*.jsonl
+*.csv
+hits.txt
+state.txt
+missed.txt
+proxies.txt
+node_modules/
