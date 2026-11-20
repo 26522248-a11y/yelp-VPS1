@@ -1,6 +1,7 @@
 runs/
 chunks/
 *.jsonl
+!examples/*.jsonl
 *.csv
 hits.txt
 state.txt

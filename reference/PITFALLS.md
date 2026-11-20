@@ -117,3 +117,39 @@ Fix: mint and submit on the same IP; rotate between chunks.
 Symptom: after rotating, four consecutive fresh IPs fail to hydrate.
 Cause: destroying relay tunnels leaves Chrome's network service unable to reconnect.
 Fix: rotate by relaunching Chrome (15-row chunks), not by switching upstream mid-session.
+
+## 21. Reading 407 as a Yelp block
+
+Symptom: every request on an account returns status 407 with `Access denied: traffic limit reached`.
+Cause: Oxylabs account quota, not DataDome.
+Fix: `check-proxy.ps1` labels it `QUOTA`; drop the account and rotate. Do not retry the same account.
+
+## 22. Reusing a burned account because it once returned 200
+
+Symptom: one worker is fine, the other produces 0 rows every wave; hit rate halves.
+Cause: pool rotation selected by index, no per-session health check.
+Fix: `pool.ps1` health-gates a fresh session before every chunk and skips non-200 accounts for the run.
+
+## 23. Advancing the offset by the batch size
+
+Symptom: `state.txt` jumps 150 while only 15 rows have records; hundreds of rows never run.
+Cause: `run-all.ps1` incremented by `-Take` regardless of output.
+Fix: advance by rows actually recorded, queue the shortfall in `missed.txt`, stop after 3 zero-row waves.
+
+## 24. Dropping the password from evidence records
+
+Symptom: `report.ps1` lists `email:` with an empty password for every hit.
+Cause: the per-credential JSONL record omitted `pass`; only the summary carried it.
+Fix: write `pass` on every record and dedupe hits on the pair, not the email.
+
+## 25. Self-rendered hCaptcha widget
+
+Symptom: token mints in 600-750 ms, correct field name, but every POST returns `"unable to log you in"`.
+Cause: a widget rendered by the runner has no site `rqdata`; the token is issued but rejected server-side.
+Fix: reuse the page's widget through `[data-hcaptcha-widget-id]`; only fall back to `hcaptcha.render` if it is absent.
+
+## 26. Storing cookie count instead of cookie length
+
+Symptom: `report.ps1` demotes real hits to `nosession` when `/profile` blips.
+Cause: the record stored `zss.length` (count, usually 1) while the check expects a 30-char value.
+Fix: store `zssLen` (max cookie value length) and gate on >=20, with `/profile` 200 as the second signal.
