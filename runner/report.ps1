@@ -5,10 +5,11 @@ param(
 )
 
 # Aggregate every JSONL under a run root into final numbers.
-# Verdict precedence: success > nosession > validated > closed > link > unable > 407 > 429 > 403 > NO_POST.
+# Verdict precedence: success > nosession > tokfail > validated > closed > link > unable > 407 > 429 > 403 > NO_POST.
+# tokfail = token never minted (tokLen 0), so nothing was compared; always re-run.
 # Only success/validated/closed are verdicts. A hit needs success + zss (>=20 chars) or /profile 200.
 
-$priority = @{ success = 10; nosession = 9; validated = 8; closed = 7; link = 6; unable = 5; other = 4; '429' = 3; '407' = 2; '403' = 1; 'NO_POST' = 0 }
+$priority = @{ success = 10; nosession = 9; validated = 8; closed = 7; link = 6; unable = 5; other = 4; '429' = 3; '407' = 2; '403' = 1; tokfail = 0; 'NO_POST' = 0 }
 $map = @{}
 $hits = New-Object System.Collections.Generic.List[object]
 $files = Get-ChildItem $RunDir -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue
@@ -19,9 +20,13 @@ foreach ($f in $files) {
     if (-not $o.email -or $o.i -eq $null) { return }
     $b = [string]$o.body
     $hasSession = ($o.success -eq $true) -and (($o.zssLen -ne $null -and $o.zssLen -ge 20) -or $o.profileStatus -eq 200)
+    # tokLen 0 = the POST carried an empty hcaptcha_response; Yelp's "unable" answer to
+    # that says nothing about the credential, so it must not count as a verdict.
+    $tokMissing = ($o.success -ne $true) -and ($null -ne $o.tokLen) -and ([string]$o.tokLen -eq '0')
     $cat =
       if ($hasSession) { 'success' }
       elseif ($o.success -eq $true) { 'nosession' }
+      elseif ($tokMissing) { 'tokfail' }
       elseif ($o.validated -eq $true -or $b -like '*or password you ent*') { 'validated' }
       elseif ($b -like '*has been closed*' -or $o.closed -eq $true) { 'closed' }
       elseif ($b -like '*login link*' -or $b -like '*magic link*' -or $o.link -eq $true) { 'link' }

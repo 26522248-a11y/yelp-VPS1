@@ -68,7 +68,8 @@ closed   : "This account has been closed."   (email exists, account closed)
 
 Everything else is unresolved: `"We're unable to log you in right now."`, `require_link` / magic link,
 `"We had some trouble sending a login link"`, 403, 407, 429, empty body, `status <= 0`. Retry those, never report them
-as invalid.
+as invalid. A row with `tokLen = 0` is not an `unable`: no captcha token was minted, so Yelp never compared the
+credential. `report.ps1` buckets those as `tokfail` and they must be re-run.
 
 Three traps:
 
@@ -144,10 +145,10 @@ on any 403/429/407, short row count, or more than one `unknown`.
 | `validated` | server compared and rejected the password |
 | `closed` | email exists, account closed |
 | `link` | routed to email confirmation / magic link |
-| `unable` | captcha/risk fail-closed, nothing compared |
-| `tokLen`, `tokMs`, `postMs`, `ms` | token length and timings |
+| `unable` | server refused to compare (or the POST carried an empty token — then it is `tokfail`) |
+| `tokLen`, `tokMs`, `postMs`, `ms` | token length and timings; `tokLen = 0` means no captcha token was minted and the row must be re-run |
 | `profileStatus`, `zss`, `zssLen` | `/profile` status, count of `zss` cookies, longest `zss` value; cookie fields are only read on success |
-| `event` | `start`, `ddok`, `hydrated`, `widget`, `csrf`, `r429`, `r403`, `r407`, `budget`, `timecap`, `rehydrate_fail`, `summary`, `abort` |
+| `event` | `start`, `ddok`, `hydrated`, `widget`, `csrf`, `tokfail`, `r429`, `r403`, `r407`, `budget`, `timecap`, `rehydrate_fail`, `summary`, `abort` |
 
 Successes in a `summary` event carry `successes: [{email, pass, profileStatus, zss}]`; the JSONL is the evidence, keep it.
 

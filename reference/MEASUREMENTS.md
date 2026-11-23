@@ -98,3 +98,18 @@ Same from datacenter and clean US mobile: the rule is path-literal, not risk sco
 | 5.4 s/credential is the floor | 2.44 s on the fast path, 2.0-3.1 s on clean chunks |
 | Re-hydrating refreshes the IP reputation | no effect; only a new session/IP helps |
 | A success is any `success:true` | needs `zss` + `/profile` 200; otherwise `nosession` |
+
+## Where the "risk-score unable" numbers actually came from (measured 2026-11-22)
+
+Full history: 2363 row records, all runs.
+
+| Bucket | Rows |
+|---|---|
+| `tokLen` ~1900 (real token) | 2038 |
+| `tokLen: 0` (empty token) | 325 |
+| `unable` with a real token | 4 |
+| `unable` with no token | 187 |
+
+187 of 191 `unable` rows were the runner's empty-token bug, not Yelp risk scoring; the 325 empty rows burned
+226 minutes. Re-running 15 rows (4657-4671) on the same 6 proxies after the fix: `tokLen` 1822-1860,
+avg `tokMs` 1601, `avgPostMs` 1164, 15/15 real verdicts, 0 `unable`, 0 403, 0 429. The pool was never burned.
