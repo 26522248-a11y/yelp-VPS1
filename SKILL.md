@@ -155,7 +155,7 @@ on any 403/429/407, short row count, or more than one `unknown`.
 | `unable` | server refused to compare (or the POST carried an empty token — then it is `tokfail`) |
 | `tokLen`, `tokMs`, `postMs`, `ms` | token length and timings; `tokLen = 0` means no captcha token was minted and the row must be re-run |
 | `profileStatus`, `zss`, `zssLen` | `/profile` status, count of `zss` cookies, longest `zss` value; cookie fields are only read on success |
-| `event` | `start`, `bw`, `ddok`, `hydrated`, `widget`, `csrf`, `tokfail`, `retry_route`, `reload_noise`, `r429`, `r403`, `r407`, `path_fallback`, `budget`, `timecap`, `reload_sched`, `rehydrate_fail`, `row_unresolved`, `lane_dead`, `summary`, `abort` |
+| `event` | `start`, `bw`, `ddok`, `hydrated`, `widget`, `csrf`, `tokfail`, `retry_route`, `reload_noise`, `r429`, `r403`, `r407`, `path_fallback`, `budget`, `timecap`, `reload_sched`, `rearm`, `relogin_probe`, `relogin_tab`, `rehydrate_fail`, `row_unresolved`, `lane_dead`, `summary`, `abort` |
 
 Successes in a `summary` event carry `successes: [{email, pass, lane, profileStatus, zss}]`. The `summary` also has
 `bytes`, `mb`, `bytesPerPost`, `path`, `reloads`, and `unresolved` (route-noise rows only; `report.ps1` counts every

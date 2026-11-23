@@ -180,3 +180,20 @@ ceiling was found. Without the reload the tail degrades after ~158 POSTs (300-po
 magic-link noise (it carries no verdict); fall back to `/login/newajax` on 404. Do not use double encoding (`%25`): 404. Hosts are not extra buckets: the counter is
 global per IP, `.ca` shares `.com`, `.co.uk`/`.com.au` only looked independent because page hydration let the 60 s
 window expire.
+
+## 29. Every correct password killed the lane (in-place logout rehydrate)
+
+Symptom: after a `success:true` row the runner logged `rehydrate_fail` and `abort why=lanes`, so a
+wave produced 1-2 rows and the next wave relaunched the whole browser. Cost: ~200 s per row.
+
+Cause: navigating the same tab to `/logout` and re-hydrating it. The SPA keeps its logged-in
+state, `/login/` comes back without the `#ajax-login` form (or stays under the page-size bar),
+and `hydrate()` gives up.
+
+Fix (all three layers are in `batch-fast.js`):
+- Log out with `fetch('/logout')` in the page, `localStorage/sessionStorage.clear()`, then delete
+  every `zss` cookie via `Network.deleteCookies` until the jar is clean.
+- Probe `/login/` up to 4 times (`relogin_probe`); if the form never appears, open a **new tab**
+  (`Target.createTarget`, shared cookie jar, old target closed) and hydrate there (`relogin_tab`).
+- A brand-new tab still has the hCaptcha bundle loading, so `armWidget()` polls up to ~8 s, and an
+  empty token on a fresh tab re-arms the widget up to 3 times (`rearm`) before the lane is dead.

