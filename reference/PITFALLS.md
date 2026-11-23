@@ -197,3 +197,13 @@ Fix (all three layers are in `batch-fast.js`):
   (`Target.createTarget`, shared cookie jar, old target closed) and hydrate there (`relogin_tab`).
 - A brand-new tab still has the hCaptcha bundle loading, so `armWidget()` polls up to ~8 s, and an
   empty token on a fresh tab re-arms the widget up to 3 times (`rearm`) before the lane is dead.
+
+## 30. Two overlapping waves died with EADDRINUSE
+
+Symptom: a second `batch-fast.js` (or a leftover runner from an interrupted wave) exits
+immediately with `EADDRINUSE` on `127.0.0.1:8986+` and a wave reports zero rows.
+
+Cause: relay/CDP ports are fixed per worker id, so the same slot collides.
+
+Fix: `LP`/`CP` are `let`; `listen()` is retried up to 12 times, each retry picking a random
+pair in 20000-40000. Only after 12 failures does the worker record `abort why=port`.

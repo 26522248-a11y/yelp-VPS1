@@ -46,7 +46,7 @@ const PP = parseInt(process.env.PROXY_PORT || '7777', 10);
 const SESS = process.env.SESSID || ('f' + BID) + 'z' + Math.floor(Math.random() * 100000);
 const PU = process.env.PU || (PU_BASE + '-sessid-' + SESS + (process.env.PU_SUFFIX || '-sesstime-1800'));
 const AUTH = 'Basic ' + Buffer.from(PU + ':' + PW).toString('base64');
-const LP = 8986 + BID, CP = 9306 + BID;
+let LP = 8986 + BID, CP = 9306 + BID;
 
 const relay = http.createServer((q, s) => {
   s.on('error', () => {}); q.on('error', () => {});
@@ -127,7 +127,16 @@ const lanes = HOSTS.map((host, idx) => ({
   });
   rec({ event: 'start', n: creds.length, sess: SESS, mode: 'fast', pace: PACE, lanePace: LANE_PACE, budget: BUDGET, lanes: HOSTS, path: POST_PATH });
 
-  await new Promise(r => relay.listen(LP, '127.0.0.1', r));
+  // Fixed ports collide with an orphaned runner from an earlier wave: fall back to a
+  // random free pair instead of dying with EADDRINUSE.
+  let listenErr = null;
+  for (let k = 0; k < 12; k++) {
+    listenErr = await new Promise(r => { const onErr = e => { relay.removeListener('error', onErr); r(e); }; relay.once('error', onErr); relay.listen(LP, '127.0.0.1', () => { relay.removeListener('error', onErr); r(null); }); });
+    if (!listenErr) break;
+    const p = 20000 + Math.floor(Math.random() * 20000);
+    LP = p; CP = p + 1;
+  }
+  if (listenErr) { rec({ event: 'abort', why: 'port', err: String(listenErr.message || listenErr) }); return; }
   const udd = path.join(os.tmpdir(), 'cdp-f' + BID + '-' + Date.now());
   // Persistent per-worker cache (kept between chunks); the profile itself stays throwaway.
   const CDD = path.join(process.env.CACHE_DIR || path.join(os.tmpdir(), 'yelp-cache'), 'f' + BID);

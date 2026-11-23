@@ -113,3 +113,11 @@ Roughly one in three random resi sessions is already flagged: `ddok:false`, or 4
 first POST. The chunk aborts in ~10-20 s and `run-all` requeues the row, so the loss is
 one row, not the chunk. There is no cheaper preflight: a POST probe costs a POST, and a
 GET probe does not reveal the POST-side flag.
+
+## Real-list run: 100 rows (2026-11-23)
+
+First 100 rows of a 3,061-row list, encoded path, `BUDGET=250`, one worker, 6 sticky
+accounts rotated by the health gate: **30 hits / 68 wrong / 1 closed**, 0 x 429, 0 x 403,
+0 x 407, 0 unknown. Two runner bugs surfaced and were fixed during the run (PITFALLS #29,
+#30). A clean 60-row wave inside that run held ~11 rows/min at 1.4 MB total with no IP
+rotation.
