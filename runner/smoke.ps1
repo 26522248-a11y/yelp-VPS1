@@ -6,7 +6,7 @@ param(
 )
 
 # Post-change smoke test: prove the page still hydrates, the widget still mints, and
-# /login/newajax still returns classified bodies. Run after any Yelp UI change and
+# the login endpoint still returns classified bodies. Run after any Yelp UI change and
 # before a long pass. Uses its own run root, so state.txt of the real run is untouched.
 #
 # Default source is examples/combo.sample.txt (fake addresses): a pass proves the
@@ -21,7 +21,7 @@ $poolScript = Join-Path $PSScriptRoot "pool.ps1"
 $outDir = Join-Path $root (Get-Date -Format "yyyyMMdd-HHmmss")
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-$log = & $poolScript -Source $Source -PoolFile $PoolFile -Skip 0 -Take $Rows -Chunk $Rows -Workers 1 -Pace 14 -OutDir $outDir 2>&1
+$log = & $poolScript -Source $Source -PoolFile $PoolFile -Skip 0 -Take $Rows -Chunk $Rows -Workers 1 -Pace 0 -OutDir $outDir 2>&1
 $log | Select-Object -Last 3
 
 $line = $log | Where-Object { $_ -like "TOTAL*" } | Select-Object -Last 1

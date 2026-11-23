@@ -3,9 +3,9 @@ param(
   [Parameter(Mandatory=$true)][string]$PoolFile,
   [Alias('Skip')][int]$StartAt = 0,
   [int]$Take = 150,
-  [int]$Chunk = 15,
+  [int]$Chunk = 250,
   [int]$Workers = 2,
-  [int]$Pace = 14,
+  [int]$Pace = 0,
   [int]$MaxDeadWaves = 3,
   [string]$Root = ".\runs"
 )

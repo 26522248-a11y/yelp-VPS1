@@ -3,9 +3,9 @@ param(
   [Parameter(Mandatory=$true)][string]$PoolFile,   # one "user:pass" proxy account per line
   [int]$Skip = 0,
   [int]$Take = 150,
-  [int]$Chunk = 15,          # POST per IP before rotation; 15 keeps under the 429 window
+  [int]$Chunk = 250,         # POST per IP before rotation (encoded path: 250 measured, no 403)
   [int]$Workers = 2,         # 2 measured stable on 4 vCPU; 3 collapses
-  [int]$Pace = 14,
+  [int]$Pace = 0,
   [int]$MaxAccountTries = 6, # cap health-gate attempts per worker slot
   [string]$ProxyHost = "pr.oxylabs.io",
   [int]$ProxyPort = 7777,

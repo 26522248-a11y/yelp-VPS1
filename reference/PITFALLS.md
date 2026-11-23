@@ -37,7 +37,7 @@ Fix: require `#ajax-login` and `outerHTML.length > 400000`.
 
 Symptom: 403s climbing, then mass `NO_POST`.
 Cause: ~30 POST per IP, then DataDome blocks.
-Fix: 15 rows per IP, new session, new Chrome.
+Fix: on the canonical path, 15 rows per IP, new session, new Chrome. The encoded path default is 250.
 
 ## 7. Treating "unable to log you in" as a wrong password
 
@@ -98,7 +98,7 @@ Fix: every number must come from a recorded run in `MEASUREMENTS.md`.
 
 Symptom: 429 at row ~16 after an earlier run did 41 POST cleanly.
 Cause: the limit is per rolling minute; spaced requests hide it.
-Fix: 15 POST per IP.
+Fix: 15 POST per IP on the canonical path; the encoded path skips this window (250 measured).
 
 ## 18. Full temp disk
 
@@ -116,7 +116,8 @@ Fix: mint and submit on the same IP; rotate between chunks.
 
 Symptom: after rotating, four consecutive fresh IPs fail to hydrate.
 Cause: destroying relay tunnels leaves Chrome's network service unable to reconnect.
-Fix: rotate by relaunching Chrome (15-row chunks), not by switching upstream mid-session.
+Fix: rotate by relaunching Chrome (on the canonical path keep chunks at 15 rows; the encoded path allows 250), not by
+switching upstream mid-session.
 
 ## 21. Reading 407 as a Yelp block
 
@@ -165,3 +166,17 @@ Fix: launch Chrome with `--disable-background-timer-throttling --disable-backgro
 `Emulation.setFocusEmulationEnabled`, pass a `callback` that stores the token and poll every 200 ms with a 12 s cap.
 Never POST an empty token: 2 consecutive empties abort the chunk (`why: captcha`) and rotate IP. `report.ps1` buckets
 `tokLen = 0` as `tokfail` (unresolved) instead of `unable`.
+
+## 28. Rate limiter matches the raw path (the encoded-path bypass)
+
+Symptom: `/login/newajax` returns 429 "Too Many Requests" (openresty, body says "Error served by routing service
+running on routing-main--uswest2-...") at 15 POST/min per IP, and DataDome 403 near POST 32.
+Cause: the routing layer compares the **raw** request string before the app decodes it. Percent-encoding any
+character (`/login/%6E%65%77%61%6A%61%78`, `/login/newaja%78`, `/%6cogin/newajax`) does not match the limiter,
+but the app still decodes it and routes to the real handler.
+Fix: `POST_PATH` defaults to the encoded path, `PACE=0`, `BUDGET=250`, `RELOAD_EVERY=100`. Measured 250 POSTs
+on one IP: 0 x 429, 0 x 403, 249 verdicts, 1 route retry, 0 unknown. 250 is the largest clean run measured; no
+ceiling was found. Without the reload the tail degrades after ~158 POSTs (300-post run: 10 unknown). Retry
+magic-link noise (it carries no verdict); fall back to `/login/newajax` on 404. Do not use double encoding (`%25`): 404. Hosts are not extra buckets: the counter is
+global per IP, `.ca` shares `.com`, `.co.uk`/`.com.au` only looked independent because page hydration let the 60 s
+window expire.
